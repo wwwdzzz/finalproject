@@ -1,144 +1,188 @@
+#include <petscdm.h>
+#include <petscdmda.h>
+#include <petscts.h>
 #include <petscksp.h>
-#include <petscmat.h>
-#include <petscvec.h>
-#include <petscsys.h>
 #include <math.h>
-#include <time.h>
+
+typedef struct {
+    PetscReal kappa;     // Thermal conductivity
+    PetscReal rho;       // Density
+    PetscReal c;         // Heat capacity
+    PetscReal dx;        // Spatial step size
+    PetscReal dt;        // Time step size
+    PetscReal T_final;   // Final time
+    PetscInt  method;    // 0=explicit, 1=implicit
+    PetscInt  nx;        // Number of grid points (新增)
+} AppCtx;
+
+PetscErrorCode InitialConditions(DM da, Vec U, AppCtx *user)
+{
+    PetscFunctionBeginUser;
+    PetscReal **u;
+    PetscInt i, xs, xn;
+    
+    DMDAVecGetArray(da, U, &u);
+    DMDAGetCorners(da, &xs, NULL, NULL, &xn, NULL, NULL);
+    
+    for (i = xs; i < xs+xn; i++) {
+        PetscReal x = i * user->dx;
+        u[i][0] = sin(M_PI * x);  // Initial condition: u(x,0) = sin(πx)
+    }
+    
+    DMDAVecRestoreArray(da, U, &u);
+    PetscFunctionReturn(0);
+}
+
+PetscErrorCode RHSFunction(TS ts, PetscReal t, Vec U, Vec F, void *ctx)
+{
+    AppCtx         *user = (AppCtx*)ctx;
+    DM             da;
+    PetscReal      **u, **f;
+    PetscInt       i, xs, xn;
+    PetscReal      coeff = user->kappa / (user->rho * user->c * user->dx * user->dx);
+    
+    TSGetDM(ts, &da);
+    DMDAVecGetArray(da, U, &u);
+    DMDAVecGetArray(da, F, &f);
+    DMDAGetCorners(da, &xs, NULL, NULL, &xn, NULL, NULL);
+    
+    // Left boundary (Dirichlet)
+    if (xs == 0) {
+        f[0][0] = 0.0;  // u(0,t) = 0
+        xs++;
+        xn--;
+    }
+    
+    // Right boundary (Dirichlet)
+    if (xs + xn == user->nx) {
+        f[user->nx-1][0] = 0.0;  // u(1,t) = 0
+        xn--;
+    }
+    
+    // Interior points
+    for (i = xs; i < xs+xn; i++) {
+        f[i][0] = coeff * (u[i-1][0] - 2.0*u[i][0] + u[i+1][0]);
+    }
+    
+    DMDAVecRestoreArray(da, U, &u);
+    DMDAVecRestoreArray(da, F, &f);
+    PetscFunctionReturn(0);
+}
+
+PetscErrorCode IFunction(TS ts, PetscReal t, Vec U, Vec Udot, Vec F, void *ctx)
+{
+    AppCtx         *user = (AppCtx*)ctx;
+    DM             da;
+    PetscReal      **u, **udot, **f;
+    PetscInt       i, xs, xn;
+    PetscReal      coeff = user->kappa / (user->rho * user->c * user->dx * user->dx);
+    
+    TSGetDM(ts, &da);
+    DMDAVecGetArray(da, U, &u);
+    DMDAVecGetArray(da, Udot, &udot);
+    DMDAVecGetArray(da, F, &f);
+    DMDAGetCorners(da, &xs, NULL, NULL, &xn, NULL, NULL);
+    
+    // Left boundary (Dirichlet)
+    if (xs == 0) {
+        f[0][0] = u[0][0];  // u(0,t) = 0
+        xs++;
+        xn--;
+    }
+    
+    // Right boundary (Dirichlet)
+    if (xs + xn == user->nx) {
+        f[user->nx-1][0] = u[user->nx-1][0];  // u(1,t) = 0
+        xn--;
+    }
+    
+    // Interior points
+    for (i = xs; i < xs+xn; i++) {
+        f[i][0] = udot[i][0] - coeff * (u[i-1][0] - 2.0*u[i][0] + u[i+1][0]);
+    }
+    
+    DMDAVecRestoreArray(da, U, &u);
+    DMDAVecRestoreArray(da, Udot, &udot);
+    DMDAVecRestoreArray(da, F, &f);
+    PetscFunctionReturn(0);
+}
 
 int main(int argc, char **argv)
 {
-   double timestart=clock();
+    DM             da;
+    TS             ts;
+    Vec            U;
+    AppCtx         user;
+    PetscInt       nx = 100;  // Default number of grid points
+    PetscReal      dt = 0.001;
+    PetscReal      T_final = 0.1;
+    PetscMPIInt    size;
+    
     PetscInitialize(&argc, &argv, NULL, NULL);
-    
-    PetscMPIInt size, rank;
     MPI_Comm_size(PETSC_COMM_WORLD, &size);
-    MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
     
-    PetscInt N = 10; 
-    PetscInt max_iter = 100; 
-    PetscReal tol = 1.0e-6; 
-    PetscBool monitor = PETSC_FALSE; 
-
-    PetscOptionsGetInt(NULL, NULL, "-N", &N, NULL);
-    PetscOptionsGetInt(NULL, NULL, "-max_iter", &max_iter, NULL);
-    PetscOptionsGetReal(NULL, NULL, "-tol", &tol, NULL);
-    PetscOptionsGetBool(NULL, NULL, "-monitor", &monitor, NULL);
+    // Set default parameters
+    user.kappa = 1.0;
+    user.rho = 1.0;
+    user.c = 1.0;
+    user.method = 1;  // Default to implicit
     
-    if (rank == 0) {
-        printf("Running inverse power iteration for %d x %d matrix\n", N, N);
-        printf("Max iterations: %d, Tolerance: %g\n", max_iter, tol);
+    // Parse command line options
+    PetscOptionsGetInt(NULL, NULL, "-nx", &nx, NULL);
+    PetscOptionsGetReal(NULL, NULL, "-dt", &dt, NULL);
+    PetscOptionsGetReal(NULL, NULL, "-T", &T_final, NULL);
+    PetscOptionsGetInt(NULL, NULL, "-method", &user.method, NULL);
+    PetscOptionsGetReal(NULL, NULL, "-kappa", &user.kappa, NULL);
+    PetscOptionsGetReal(NULL, NULL, "-rho", &user.rho, NULL);
+    PetscOptionsGetReal(NULL, NULL, "-c", &user.c, NULL);
+    
+    user.dx = 1.0 / (nx - 1);
+    user.dt = dt;
+    user.T_final = T_final;
+    user.nx = nx;  // 初始化nx
+    
+    // Create distributed array
+    DMDACreate1d(PETSC_COMM_WORLD, DM_BOUNDARY_NONE, nx, 1, 1, NULL, &da);
+    DMSetFromOptions(da);
+    DMSetUp(da);
+    
+    // Create solution vector
+    DMCreateGlobalVector(da, &U);
+    InitialConditions(da, U, &user);
+    
+    // Create timestepper
+    TSCreate(PETSC_COMM_WORLD, &ts);
+    TSSetDM(ts, da);
+    TSSetProblemType(ts, TS_LINEAR);
+    TSSetType(ts, TSEULER);
+    TSSetMaxSteps(ts, (PetscInt)(T_final / dt) + 1);
+    TSSetTimeStep(ts, dt);
+    TSSetExactFinalTime(ts, TS_EXACTFINALTIME_MATCHSTEP);
+    
+    if (user.method == 0) {  // Explicit
+        TSSetRHSFunction(ts, NULL, RHSFunction, &user);
+    } else {  // Implicit
+        TSSetIFunction(ts, NULL, IFunction, &user);
+        Mat A;
+        MatCreate(da, &A);
+        MatSetFromOptions(A);
+        TSSetIJacobian(ts, A, A, NULL, NULL);
+        MatDestroy(&A);
     }
     
-    Mat A;
-    MatCreate(PETSC_COMM_WORLD, &A);
-    MatSetSizes(A, PETSC_DECIDE, PETSC_DECIDE, N, N);
-    MatSetFromOptions(A);
-    MatSetUp(A);
+    TSSetFromOptions(ts);
+    TSSolve(ts, U);
     
-    PetscInt i, Istart, Iend;
-    MatGetOwnershipRange(A, &Istart, &Iend);
+    // Output final solution
+    PetscViewer viewer;
+    PetscViewerASCIIOpen(PETSC_COMM_WORLD, "solution.txt", &viewer);
+    VecView(U, viewer);
+    PetscViewerDestroy(&viewer);
     
-    for (i = Istart; i < Iend; i++) {
-        PetscScalar v = 2.0;
-        MatSetValues(A, 1, &i, 1, &i, &v, INSERT_VALUES);
-        
-        if (i > 0) {
-            PetscInt j = i - 1;
-            PetscScalar v = -1.0;
-            MatSetValues(A, 1, &i, 1, &j, &v, INSERT_VALUES);
-        }
-        
-        if (i < N - 1) {
-            PetscInt j = i + 1;
-            PetscScalar v = -1.0;
-            MatSetValues(A, 1, &i, 1, &j, &v, INSERT_VALUES);
-        }
-    }
-    
-    MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY);
-    MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY);
-    
-    KSP ksp;
-    KSPCreate(PETSC_COMM_WORLD, &ksp);
-    KSPSetOperators(ksp, A, A);
- 
-    KSPSetFromOptions(ksp);
-    
-    if (monitor) {
-        KSPMonitorSet(ksp, KSPMonitorDefault, NULL, NULL);
-    }
-    
-    Vec z_prev, z_curr, y;
-    VecCreate(PETSC_COMM_WORLD, &z_prev);
-    VecCreate(PETSC_COMM_WORLD, &z_curr);
-    VecCreate(PETSC_COMM_WORLD, &y);
-    VecSetSizes(z_prev, PETSC_DECIDE, N);
-    VecSetSizes(z_curr, PETSC_DECIDE, N);
-    VecSetSizes(y, PETSC_DECIDE, N);
-    VecSetFromOptions(z_prev);
-    VecSetFromOptions(z_curr);
-    VecSetFromOptions(y);
-    
-    PetscScalar one = 1.0;
-    PetscScalar zero = 0.0;
-    if (Istart == 0) {
-        VecSetValue(z_prev, 0, one, INSERT_VALUES);
-    }
-    for (i = 1; i < N; i++) {
-        VecSetValue(z_prev, i, zero, INSERT_VALUES);
-    }
-    VecAssemblyBegin(z_prev);
-    VecAssemblyEnd(z_prev);
-
-    PetscReal norm_prev = 0.0, norm_curr = 0.0;
-    PetscReal lambda = 0.0;
-    PetscInt k;
-    PetscBool converged = PETSC_FALSE;
-    
-    for (k = 0; k < max_iter; k++) {
-        KSPSolve(ksp, z_prev, y);
-
-        VecNorm(y, NORM_2, &norm_curr);
-
-        VecCopy(y, z_curr);
-        VecScale(z_curr, 1.0/norm_curr);
-
-        if (k > 0 && PetscAbsReal(norm_curr - norm_prev) < tol) {
-            converged = PETSC_TRUE;
-            break;
-        }
-
-        VecCopy(z_curr, z_prev);
-        norm_prev = norm_curr;
-    }
-
-    if (converged) {
-        Vec Ay;
-        VecDuplicate(y, &Ay);
-        MatMult(A, y, Ay);
-        VecDot(y, Ay, &lambda);
-        lambda = 1.0 / lambda;
-        
-        if (rank == 0) {
-            printf("Converged after %d iterations\n", k);
-            printf("Smallest eigenvalue estimate: %g\n", lambda);
-        }
-    } else {
-        if (rank == 0) {
-            printf("Did not converge after %d iterations\n", max_iter);
-        }
-    }
-
-    VecDestroy(&z_prev);
-    VecDestroy(&z_curr);
-    VecDestroy(&y);
-    MatDestroy(&A);
-    KSPDestroy(&ksp);
-    
+    // Cleanup
+    VecDestroy(&U);
+    TSDestroy(&ts);
+    DMDestroy(&da);
     PetscFinalize();
-    double timeend=clock();
-    
-    double cputimeused=((double)(timeend-timestart))/CLOCKS_PER_SEC;
-    printf("cpu timeused %f s\n",cputimeused);
     return 0;
-}
+    }
