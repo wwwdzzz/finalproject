@@ -1,188 +1,185 @@
 #include <petscdm.h>
 #include <petscdmda.h>
-#include <petscts.h>
+#include <petscmat.h>
+#include <petscvec.h>
 #include <petscksp.h>
 #include <math.h>
+#include <time.h>
 
 typedef struct {
-    PetscReal kappa;     // Thermal conductivity
-    PetscReal rho;       // Density
-    PetscReal c;         // Heat capacity
-    PetscReal dx;        // Spatial step size
-    PetscReal dt;        // Time step size
-    PetscReal T_final;   // Final time
-    PetscInt  method;    // 0=explicit, 1=implicit
-    PetscInt  nx;        // Number of grid points (新增)
+    PetscReal kappa;
+    PetscReal rho;
+    PetscReal c;
+    PetscReal dx;
+    PetscReal dt;
+    PetscReal T_final;
+    PetscInt  method;
+    PetscInt  nx;
+    DM        da;
+    Mat       A;
+    KSP       ksp;
 } AppCtx;
 
-PetscErrorCode InitialConditions(DM da, Vec U, AppCtx *user)
-{
+PetscErrorCode Initialize(AppCtx* user) {
     PetscFunctionBeginUser;
-    PetscReal **u;
-    PetscInt i, xs, xn;
     
-    DMDAVecGetArray(da, U, &u);
-    DMDAGetCorners(da, &xs, NULL, NULL, &xn, NULL, NULL);
+    if (user->method == 1) {
+        DMCreateMatrix(user->da, &user->A);
+        
+        PetscInt i, xs, xn;
+        DMDAGetCorners(user->da, &xs, NULL, NULL, &xn, NULL, NULL);
+        PetscReal coeff = user->kappa / (user->rho * user->c * user->dx * user->dx);
+        
+        for (i = xs; i < xs+xn; i++) {
+            PetscInt row = i;
+            PetscScalar value;
+            
+            if (i == 0 || i == user->nx-1) {
+                MatSetValue(user->A, row, row, 1.0, INSERT_VALUES);
+                continue;
+            }
+            
+            value = 1.0 + 2.0 * user->dt * coeff;
+            MatSetValue(user->A, row, row, value, INSERT_VALUES);
+            
+            value = -user->dt * coeff;
+            MatSetValue(user->A, row, row-1, value, INSERT_VALUES);
+            MatSetValue(user->A, row, row+1, value, INSERT_VALUES);
+        }
+        
+        MatAssemblyBegin(user->A, MAT_FINAL_ASSEMBLY);
+        MatAssemblyEnd(user->A, MAT_FINAL_ASSEMBLY);
+        
+        KSPCreate(PETSC_COMM_WORLD, &user->ksp);
+        KSPSetOperators(user->ksp, user->A, user->A);
+        KSPSetFromOptions(user->ksp);
+    }
+    
+    PetscFunctionReturn(0);
+}
+
+PetscErrorCode SetInitialConditions(Vec U, AppCtx* user) {
+    PetscFunctionBeginUser;
+    PetscScalar *u;
+    VecGetArray(U, &u);
+    
+    PetscInt i, xs, xn;
+    DMDAGetCorners(user->da, &xs, NULL, NULL, &xn, NULL, NULL);
     
     for (i = xs; i < xs+xn; i++) {
         PetscReal x = i * user->dx;
-        u[i][0] = sin(M_PI * x);  // Initial condition: u(x,0) = sin(πx)
+        u[i] = sin(M_PI * x);
     }
     
-    DMDAVecRestoreArray(da, U, &u);
+    VecRestoreArray(U, &u);
     PetscFunctionReturn(0);
 }
 
-PetscErrorCode RHSFunction(TS ts, PetscReal t, Vec U, Vec F, void *ctx)
-{
-    AppCtx         *user = (AppCtx*)ctx;
-    DM             da;
-    PetscReal      **u, **f;
-    PetscInt       i, xs, xn;
-    PetscReal      coeff = user->kappa / (user->rho * user->c * user->dx * user->dx);
+PetscErrorCode ExplicitEulerStep(Vec U, Vec Unew, AppCtx* user) {
+    PetscFunctionBeginUser;
+    PetscScalar *u, *unew;
+    VecGetArray(U, &u);
+    VecGetArray(Unew, &unew);
     
-    TSGetDM(ts, &da);
-    DMDAVecGetArray(da, U, &u);
-    DMDAVecGetArray(da, F, &f);
-    DMDAGetCorners(da, &xs, NULL, NULL, &xn, NULL, NULL);
+    PetscInt i, xs, xn;
+    DMDAGetCorners(user->da, &xs, NULL, NULL, &xn, NULL, NULL);
+    PetscReal coeff = user->kappa / (user->rho * user->c * user->dx * user->dx);
     
-    // Left boundary (Dirichlet)
-    if (xs == 0) {
-        f[0][0] = 0.0;  // u(0,t) = 0
-        xs++;
-        xn--;
-    }
+    if (xs == 0) unew[0] = 0.0;
+    if (xs + xn == user->nx) unew[user->nx-1] = 0.0;
     
-    // Right boundary (Dirichlet)
-    if (xs + xn == user->nx) {
-        f[user->nx-1][0] = 0.0;  // u(1,t) = 0
-        xn--;
-    }
-    
-    // Interior points
     for (i = xs; i < xs+xn; i++) {
-        f[i][0] = coeff * (u[i-1][0] - 2.0*u[i][0] + u[i+1][0]);
+        if (i > 0 && i < user->nx-1) {
+            unew[i] = u[i] + user->dt * coeff * (u[i-1] - 2.0*u[i] + u[i+1]);
+        }
     }
     
-    DMDAVecRestoreArray(da, U, &u);
-    DMDAVecRestoreArray(da, F, &f);
+    VecRestoreArray(U, &u);
+    VecRestoreArray(Unew, &unew);
+    
+    DMLocalToGlobalBegin(user->da, Unew, INSERT_VALUES, Unew);
+    DMLocalToGlobalEnd(user->da, Unew, INSERT_VALUES, Unew);
+    
     PetscFunctionReturn(0);
 }
 
-PetscErrorCode IFunction(TS ts, PetscReal t, Vec U, Vec Udot, Vec F, void *ctx)
-{
-    AppCtx         *user = (AppCtx*)ctx;
-    DM             da;
-    PetscReal      **u, **udot, **f;
-    PetscInt       i, xs, xn;
-    PetscReal      coeff = user->kappa / (user->rho * user->c * user->dx * user->dx);
-    
-    TSGetDM(ts, &da);
-    DMDAVecGetArray(da, U, &u);
-    DMDAVecGetArray(da, Udot, &udot);
-    DMDAVecGetArray(da, F, &f);
-    DMDAGetCorners(da, &xs, NULL, NULL, &xn, NULL, NULL);
-    
-    // Left boundary (Dirichlet)
-    if (xs == 0) {
-        f[0][0] = u[0][0];  // u(0,t) = 0
-        xs++;
-        xn--;
-    }
-    
-    // Right boundary (Dirichlet)
-    if (xs + xn == user->nx) {
-        f[user->nx-1][0] = u[user->nx-1][0];  // u(1,t) = 0
-        xn--;
-    }
-    
-    // Interior points
-    for (i = xs; i < xs+xn; i++) {
-        f[i][0] = udot[i][0] - coeff * (u[i-1][0] - 2.0*u[i][0] + u[i+1][0]);
-    }
-    
-    DMDAVecRestoreArray(da, U, &u);
-    DMDAVecRestoreArray(da, Udot, &udot);
-    DMDAVecRestoreArray(da, F, &f);
+PetscErrorCode ImplicitEulerStep(Vec U, Vec Unew, AppCtx* user) {
+    PetscFunctionBeginUser;
+    VecCopy(U, Unew);
+    KSPSolve(user->ksp, U, Unew);
     PetscFunctionReturn(0);
 }
 
-int main(int argc, char **argv)
-{
-    DM             da;
-    TS             ts;
-    Vec            U;
+int main(int argc, char **argv) {
     AppCtx         user;
-    PetscInt       nx = 100;  // Default number of grid points
-    PetscReal      dt = 0.001;
-    PetscReal      T_final = 0.1;
-    PetscMPIInt    size;
+    Vec            U, Unew;
+    PetscInt       nsteps;
+    PetscMPIInt    rank;
+    PetscLogDouble t1, t2;
     
     PetscInitialize(&argc, &argv, NULL, NULL);
-    MPI_Comm_size(PETSC_COMM_WORLD, &size);
+    MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
     
-    // Set default parameters
     user.kappa = 1.0;
     user.rho = 1.0;
     user.c = 1.0;
-    user.method = 1;  // Default to implicit
+    user.method = 1;
+    user.nx = 100;
+    user.dt = 0.001;
+    user.T_final = 0.1;
     
-    // Parse command line options
-    PetscOptionsGetInt(NULL, NULL, "-nx", &nx, NULL);
-    PetscOptionsGetReal(NULL, NULL, "-dt", &dt, NULL);
-    PetscOptionsGetReal(NULL, NULL, "-T", &T_final, NULL);
+    PetscOptionsGetInt(NULL, NULL, "-nx", &user.nx, NULL);
+    PetscOptionsGetReal(NULL, NULL, "-dt", &user.dt, NULL);
+    PetscOptionsGetReal(NULL, NULL, "-T", &user.T_final, NULL);
     PetscOptionsGetInt(NULL, NULL, "-method", &user.method, NULL);
-    PetscOptionsGetReal(NULL, NULL, "-kappa", &user.kappa, NULL);
-    PetscOptionsGetReal(NULL, NULL, "-rho", &user.rho, NULL);
-    PetscOptionsGetReal(NULL, NULL, "-c", &user.c, NULL);
     
-    user.dx = 1.0 / (nx - 1);
-    user.dt = dt;
-    user.T_final = T_final;
-    user.nx = nx;  // 初始化nx
+    user.dx = 1.0 / (user.nx - 1);
+    nsteps = (PetscInt)(user.T_final / user.dt) + 1;
     
-    // Create distributed array
-    DMDACreate1d(PETSC_COMM_WORLD, DM_BOUNDARY_NONE, nx, 1, 1, NULL, &da);
-    DMSetFromOptions(da);
-    DMSetUp(da);
+    DMDACreate1d(PETSC_COMM_WORLD, DM_BOUNDARY_GHOSTED, user.nx, 1, 1, NULL, &user.da);
+    DMSetFromOptions(user.da);
+    DMSetUp(user.da);
     
-    // Create solution vector
-    DMCreateGlobalVector(da, &U);
-    InitialConditions(da, U, &user);
+    Initialize(&user);
     
-    // Create timestepper
-    TSCreate(PETSC_COMM_WORLD, &ts);
-    TSSetDM(ts, da);
-    TSSetProblemType(ts, TS_LINEAR);
-    TSSetType(ts, TSEULER);
-    TSSetMaxSteps(ts, (PetscInt)(T_final / dt) + 1);
-    TSSetTimeStep(ts, dt);
-    TSSetExactFinalTime(ts, TS_EXACTFINALTIME_MATCHSTEP);
+    // 修正点：使用.操作符而不是->，因为user是局部变量
+    DMCreateGlobalVector(user.da, &U);
+    DMCreateGlobalVector(user.da, &Unew);
+    SetInitialConditions(U, &user);
     
-    if (user.method == 0) {  // Explicit
-        TSSetRHSFunction(ts, NULL, RHSFunction, &user);
-    } else {  // Implicit
-        TSSetIFunction(ts, NULL, IFunction, &user);
-        Mat A;
-        MatCreate(da, &A);
-        MatSetFromOptions(A);
-        TSSetIJacobian(ts, A, A, NULL, NULL);
-        MatDestroy(&A);
+    PetscTime(&t1);
+    for (PetscInt step = 0; step < nsteps; step++) {
+        if (user.method == 0) {
+            ExplicitEulerStep(U, Unew, &user);
+        } else {
+            ImplicitEulerStep(U, Unew, &user);
+        }
+        VecSwap(U, Unew);
+        
+        if (step % 100 == 0 && rank == 0) {
+            PetscPrintf(PETSC_COMM_SELF, "Step %d/%d, Time %.4f/%.4f\n", 
+                       step, nsteps, step*user.dt, user.T_final);
+        }
+    }
+    PetscTime(&t2);
+    
+    if (rank == 0) {
+        PetscPrintf(PETSC_COMM_SELF, "Completed %d steps in %.4f seconds\n", 
+                   nsteps, t2-t1);
     }
     
-    TSSetFromOptions(ts);
-    TSSolve(ts, U);
-    
-    // Output final solution
     PetscViewer viewer;
     PetscViewerASCIIOpen(PETSC_COMM_WORLD, "solution.txt", &viewer);
     VecView(U, viewer);
     PetscViewerDestroy(&viewer);
     
-    // Cleanup
     VecDestroy(&U);
-    TSDestroy(&ts);
-    DMDestroy(&da);
+    VecDestroy(&Unew);
+    if (user.method == 1) {
+        MatDestroy(&user.A);
+        KSPDestroy(&user.ksp);
+    }
+    DMDestroy(&user.da);
     PetscFinalize();
     return 0;
-    }
+}
