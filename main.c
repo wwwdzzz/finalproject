@@ -5,20 +5,21 @@
 #include <petscksp.h>
 #include <math.h>
 #include <time.h>
-#include <stdio.h>
 
 typedef struct {
-    PetscReal kappa;
-    PetscReal rho;
-    PetscReal c;
-    PetscReal dx;
-    PetscReal dt;
-    PetscReal T_final;
-    PetscInt  method;
-    PetscInt  nx;
-    DM        da;
-    Mat       A;
-    KSP       ksp;
+    PetscReal kappa;     // Thermal conductivity
+    PetscReal rho;       // Density
+    PetscReal c;         // Heat capacity
+    PetscReal dx, dy;    // Spatial step sizes
+    PetscReal dt;        // Time step size
+    PetscReal T_final;   // Final time
+    PetscInt  method;    // 0=explicit, 1=implicit
+    PetscInt  nx, ny;    // Grid dimensions
+    DM        da;        // Distributed array context
+    Mat       A;         // Matrix for implicit method
+    KSP       ksp;       // Linear solver context
+    PetscReal bc_values[4]; // Boundary condition values
+    PetscInt  bc_types[4];  // Boundary condition types
 } AppCtx;
 
 PetscErrorCode Initialize(AppCtx* user) {
@@ -27,25 +28,92 @@ PetscErrorCode Initialize(AppCtx* user) {
     if (user->method == 1) {
         DMCreateMatrix(user->da, &user->A);
         
-        PetscInt i, xs, xn;
-        DMDAGetCorners(user->da, &xs, NULL, NULL, &xn, NULL, NULL);
-        PetscReal coeff = user->kappa / (user->rho * user->c * user->dx * user->dx);
+        PetscInt i, j, xs, ys, xn, yn;
+        DMDAGetCorners(user->da, &xs, &ys, NULL, &xn, &yn, NULL);
         
-        for (i = xs; i < xs+xn; i++) {
-            PetscInt row = i;
-            PetscScalar value;
-            
-            if (i == 0 || i == user->nx-1) {
-                MatSetValue(user->A, row, row, 1.0, INSERT_VALUES);
-                continue;
+        PetscReal coeff_x = user->kappa * user->dt / (user->rho * user->c * user->dx * user->dx);
+        PetscReal coeff_y = user->kappa * user->dt / (user->rho * user->c * user->dy * user->dy);
+        
+        for (j = ys; j < ys+yn; j++) {
+            for (i = xs; i < xs+xn; i++) {
+                PetscInt row = i + j * user->nx;
+                PetscInt col[5];
+                PetscScalar values[5];
+                PetscInt ncols = 0;
+                
+                // Left boundary (Dirichlet)
+                if (i == 0) {
+                    // Set diagonal to 1 and right-hand side will set the value
+                    MatSetValue(user->A, row, row, 1.0, INSERT_VALUES);
+                    continue;
+                }
+                
+                // Right boundary (Dirichlet)
+                if (i == user->nx-1) {
+                    // Set diagonal to 1 and right-hand side will set the value
+                    MatSetValue(user->A, row, row, 1.0, INSERT_VALUES);
+                    continue;
+                }
+                
+                // Bottom boundary (Neumann: ∂u/∂y = 0)
+                if (j == 0) {
+                    // Use ghost point: u_{i,-1} = u_{i,1}
+                    // So the equation becomes (u_{i,1} - u_{i,-1})/(2dy) = 0
+                    // Which simplifies to the standard central difference
+                    col[ncols] = row;           // u_{i,0}
+                    values[ncols] = 1.0 + 2.0*coeff_x + 2.0*coeff_y;
+                    ncols++;
+                    col[ncols] = row - 1;       // u_{i-1,0}
+                    values[ncols] = -coeff_x;
+                    ncols++;
+                    col[ncols] = row + 1;       // u_{i+1,0}
+                    values[ncols] = -coeff_x;
+                    ncols++;
+                    col[ncols] = row + user->nx; // u_{i,1} (top neighbor)
+                    values[ncols] = -2.0*coeff_y; // Because u_{i,-1} = u_{i,1}
+                    ncols++;
+                    MatSetValues(user->A, 1, &row, ncols, col, values, INSERT_VALUES);
+                    continue;
+                }
+                
+                // Top boundary (Neumann: ∂u/∂y = 0)
+                if (j == user->ny-1) {
+                    // Similar to bottom boundary
+                    col[ncols] = row;           // u_{i,ny-1}
+                    values[ncols] = 1.0 + 2.0*coeff_x + 2.0*coeff_y;
+                    ncols++;
+                    col[ncols] = row - 1;       // u_{i-1,ny-1}
+                    values[ncols] = -coeff_x;
+                    ncols++;
+                    col[ncols] = row + 1;       // u_{i+1,ny-1}
+                    values[ncols] = -coeff_x;
+                    ncols++;
+                    col[ncols] = row - user->nx; // u_{i,ny-2} (bottom neighbor)
+                    values[ncols] = -2.0*coeff_y; // Because u_{i,ny} = u_{i,ny-2}
+                    ncols++;
+                    MatSetValues(user->A, 1, &row, ncols, col, values, INSERT_VALUES);
+                    continue;
+                }
+                
+                // Interior points
+                col[ncols] = row;
+                values[ncols] = 1.0 + 2.0*coeff_x + 2.0*coeff_y;
+                ncols++;
+                col[ncols] = row - 1;
+                values[ncols] = -coeff_x;
+                ncols++;
+                col[ncols] = row + 1;
+                values[ncols] = -coeff_x;
+                ncols++;
+                col[ncols] = row - user->nx;
+                values[ncols] = -coeff_y;
+                ncols++;
+                col[ncols] = row + user->nx;
+                values[ncols] = -coeff_y;
+                ncols++;
+                
+                MatSetValues(user->A, 1, &row, ncols, col, values, INSERT_VALUES);
             }
-            
-            value = 1.0 + 2.0 * user->dt * coeff;
-            MatSetValue(user->A, row, row, value, INSERT_VALUES);
-            
-            value = -user->dt * coeff;
-            MatSetValue(user->A, row, row-1, value, INSERT_VALUES);
-            MatSetValue(user->A, row, row+1, value, INSERT_VALUES);
         }
         
         MatAssemblyBegin(user->A, MAT_FINAL_ASSEMBLY);
@@ -61,175 +129,140 @@ PetscErrorCode Initialize(AppCtx* user) {
 
 PetscErrorCode SetInitialConditions(Vec U, AppCtx* user) {
     PetscFunctionBeginUser;
-    PetscScalar *u;
-    VecGetArray(U, &u);
+    PetscScalar **u;
+    DMDAVecGetArray(user->da, U, &u);
     
-    PetscInt i, xs, xn;
-    DMDAGetCorners(user->da, &xs, NULL, NULL, &xn, NULL, NULL);
+    PetscInt i, j, xs, ys, xn, yn;
+    DMDAGetCorners(user->da, &xs, &ys, NULL, &xn, &yn, NULL);
     
-    for (i = xs; i < xs+xn; i++) {
-        PetscReal x = i * user->dx;
-        u[i] = sin(M_PI * x);
+    for (j = ys; j < ys+yn; j++) {
+        PetscReal y = j * user->dy;
+        for (i = xs; i < xs+xn; i++) {
+            PetscReal x = i * user->dx;
+            u[j][i] = (1.0 - x) + 0.1 * sin(2*M_PI*x) * sin(2*M_PI*y);
+        }
     }
     
-    VecRestoreArray(U, &u);
+    DMDAVecRestoreArray(user->da, U, &u);
+    PetscFunctionReturn(0);
+}
+
+PetscErrorCode ApplyBoundaryConditions(Vec U, AppCtx* user) {
+    PetscFunctionBeginUser;
+    PetscScalar **u;
+    DMDAVecGetArray(user->da, U, &u);
+    
+    PetscInt i, j, xs, ys, xn, yn;
+    DMDAGetCorners(user->da, &xs, &ys, NULL, &xn, &yn, NULL);
+    
+    // Left boundary (Dirichlet)
+    if (xs == 0) {
+        for (j = ys; j < ys+yn; j++) {
+            u[j][0] = user->bc_values[0];
+        }
+    }
+    
+    // Right boundary (Dirichlet)
+    if (xs + xn == user->nx) {
+        for (j = ys; j < ys+yn; j++) {
+            u[j][user->nx-1] = user->bc_values[1];
+        }
+    }
+    
+    // Bottom boundary (Neumann: ∂u/∂y = 0)
+    if (ys == 0) {
+        for (i = xs; i < xs+xn; i++) {
+            if (i > 0 && i < user->nx-1) {
+                u[0][i] = u[1][i];
+            }
+        }
+    }
+    
+    // Top boundary (Neumann: ∂u/∂y = 0)
+    if (ys + yn == user->ny) {
+        for (i = xs; i < xs+xn; i++) {
+            if (i > 0 && i < user->nx-1) {
+                u[user->ny-1][i] = u[user->ny-2][i];
+            }
+        }
+    }
+    
+    DMDAVecRestoreArray(user->da, U, &u);
     PetscFunctionReturn(0);
 }
 
 PetscErrorCode ExplicitEulerStep(Vec U, Vec Unew, AppCtx* user) {
     PetscFunctionBeginUser;
-    PetscScalar *u, *unew;
-    VecGetArray(U, &u);
-    VecGetArray(Unew, &unew);
+    PetscScalar **u, **unew;
+    DMDAVecGetArray(user->da, U, &u);
+    DMDAVecGetArray(user->da, Unew, &unew);
     
-    PetscInt i, xs, xn;
-    DMDAGetCorners(user->da, &xs, NULL, NULL, &xn, NULL, NULL);
-    PetscReal coeff = user->kappa / (user->rho * user->c * user->dx * user->dx);
+    PetscInt i, j, xs, ys, xn, yn;
+    DMDAGetCorners(user->da, &xs, &ys, NULL, &xn, &yn, NULL);
     
-    if (xs == 0) unew[0] = 0.0;
-    if (xs + xn == user->nx) unew[user->nx-1] = 0.0;
+    PetscReal coeff_x = user->kappa * user->dt / (user->rho * user->c * user->dx * user->dx);
+    PetscReal coeff_y = user->kappa * user->dt / (user->rho * user->c * user->dy * user->dy);
     
-    for (i = xs; i < xs+xn; i++) {
-        if (i > 0 && i < user->nx-1) {
-            unew[i] = u[i] + user->dt * coeff * (u[i-1] - 2.0*u[i] + u[i+1]);
+    VecCopy(U, Unew);
+    
+    for (j = PetscMax(ys,1); j < PetscMin(ys+yn,user->ny-1); j++) {
+        for (i = PetscMax(xs,1); i < PetscMin(xs+xn,user->nx-1); i++) {
+            unew[j][i] = u[j][i] + 
+                coeff_x * (u[j][i-1] - 2.0*u[j][i] + u[j][i+1]) +
+                coeff_y * (u[j-1][i] - 2.0*u[j][i] + u[j+1][i]);
         }
     }
     
-    VecRestoreArray(U, &u);
-    VecRestoreArray(Unew, &unew);
+    DMDAVecRestoreArray(user->da, U, &u);
+    DMDAVecRestoreArray(user->da, Unew, &unew);
     
-    DMLocalToGlobalBegin(user->da, Unew, INSERT_VALUES, Unew);
-    DMLocalToGlobalEnd(user->da, Unew, INSERT_VALUES, Unew);
+    DMLocalToLocalBegin(user->da, Unew, INSERT_VALUES, Unew);
+    DMLocalToLocalEnd(user->da, Unew, INSERT_VALUES, Unew);
+    
+    ApplyBoundaryConditions(Unew, user);
     
     PetscFunctionReturn(0);
 }
 
 PetscErrorCode ImplicitEulerStep(Vec U, Vec Unew, AppCtx* user) {
     PetscFunctionBeginUser;
-    VecCopy(U, Unew);
-    KSPSolve(user->ksp, U, Unew);
-    PetscFunctionReturn(0);
-}
-
-PetscErrorCode WriteSolutionToFileSerial(Vec U, AppCtx* user) {
-    PetscFunctionBeginUser;
-    PetscScalar *u;
-    PetscInt i, xs, xn;
-    FILE *fp;
-
-    VecGetArray(U, &u);
-    DMDAGetCorners(user->da, &xs, NULL, NULL, &xn, NULL, NULL);
-
-    // Only rank 0 writes the file (gathers all data)
-    if (user->da->comm->rank == 0) {
-        fp = fopen("solution_serial.txt", "w");
-        if (!fp) {
-            SETERRQ(PETSC_COMM_SELF, PETSC_ERR_FILE_OPEN, "Cannot open solution_serial.txt");
-        }
-        fprintf(fp, "X\tY\tTemperature\n");  // Header line
-
-        // Write rank 0's portion
-        for (i = xs; i < xs+xn; i++) {
-            PetscReal x = i * user->dx;
-            fprintf(fp, "%.6f\t0.0\t%.6f\n", x, u[i]);
-        }
-
-        // Receive and write data from other ranks
-        PetscMPIInt size;
-        MPI_Comm_size(PETSC_COMM_WORLD, &size);
-        
-        if (size > 1) {
-            PetscInt *counts = (PetscInt*)malloc(size * sizeof(PetscInt));
-            PetscInt *displs = (PetscInt*)malloc(size * sizeof(PetscInt));
-            
-            // Gather all counts
-            PetscInt my_count = xn;
-            MPI_Gather(&my_count, 1, MPI_INT, counts, 1, MPI_INT, 0, PETSC_COMM_WORLD);
-            
-            // Calculate displacements
-            displs[0] = 0;
-            for (PetscMPIInt r = 1; r < size; r++) {
-                displs[r] = displs[r-1] + counts[r-1];
-            }
-            
-            // Allocate receive buffer
-            PetscScalar *recv_buf = (PetscScalar*)malloc(user->nx * sizeof(PetscScalar));
-            
-            // Gather all data
-            MPI_Gatherv(u, xn, MPIU_SCALAR, recv_buf, counts, displs, MPIU_SCALAR, 0, PETSC_COMM_WORLD);
-            
-            // Write other ranks' data
-            for (PetscMPIInt r = 1; r < size; r++) {
-                for (i = displs[r]; i < displs[r] + counts[r]; i++) {
-                    PetscReal x = i * user->dx;
-                    fprintf(fp, "%.6f\t0.0\t%.6f\n", x, recv_buf[i]);
-                }
-            }
-            
-            free(counts);
-            free(displs);
-            free(recv_buf);
-        }
-        
-        fclose(fp);
-    } else {
-        // Other ranks send their data to rank 0
-        PetscInt my_count = xn;
-        MPI_Gather(&my_count, 1, MPI_INT, NULL, 1, MPI_INT, 0, PETSC_COMM_WORLD);
-        MPI_Gatherv(u, xn, MPIU_SCALAR, NULL, NULL, NULL, MPIU_SCALAR, 0, PETSC_COMM_WORLD);
-    }
-
-    VecRestoreArray(U, &u);
-    PetscFunctionReturn(0);
-}
-
-PetscErrorCode WriteSolutionToFileParallel(Vec U, AppCtx* user) {
-    PetscFunctionBeginUser;
-    PetscScalar *u;
-    PetscInt i, xs, xn;
-    MPI_File fh;
-    char *buffer;
-    size_t buffer_size;
-    PetscMPIInt rank;
-    MPI_Status status;
-
-    MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
-
-    VecGetArray(U, &u);
-    DMDAGetCorners(user->da, &xs, NULL, NULL, &xn, NULL, NULL);
-
-    // First, have rank 0 write the header
-    if (rank == 0) {
-        char header[] = "X\tY\tTemperature\n";
-        MPI_File_open(PETSC_COMM_SELF, "solution_parallel.txt", 
-                     MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &fh);
-        MPI_File_write(fh, header, strlen(header), MPI_CHAR, &status);
-        MPI_File_close(&fh);
-    }
-    MPI_Barrier(PETSC_COMM_WORLD);
-
-    // Now each process writes its portion
-    // Calculate required buffer size (3 values per point, each up to 20 chars + tabs/newline)
-    buffer_size = xn * 64;  // Generous estimate
-    buffer = (char*)malloc(buffer_size);
-    char *ptr = buffer;
-
-    for (i = xs; i < xs+xn; i++) {
-        PetscReal x = i * user->dx;
-        ptr += sprintf(ptr, "%.6f\t0.0\t%.6f\n", x, u[i]);
-    }
-
-    // Open file in append mode
-    MPI_File_open(PETSC_COMM_WORLD, "solution_parallel.txt", 
-                 MPI_MODE_WRONLY | MPI_MODE_APPEND, MPI_INFO_NULL, &fh);
     
-    // Each process writes its portion
-    MPI_File_write_shared(fh, buffer, ptr - buffer, MPI_CHAR, &status);
+    Vec b;
+    VecDuplicate(U, &b);
+    VecCopy(U, b);
     
-    MPI_File_close(&fh);
-    free(buffer);
-    VecRestoreArray(U, &u);
-
+    // Apply boundary conditions to right-hand side
+    PetscScalar **b_array;
+    DMDAVecGetArray(user->da, b, &b_array);
+    
+    PetscInt xs, ys, xn, yn;
+    DMDAGetCorners(user->da, &xs, &ys, NULL, &xn, &yn, NULL);
+    
+    // Left boundary (Dirichlet)
+    if (xs == 0) {
+        for (PetscInt j = ys; j < ys+yn; j++) {
+            b_array[j][0] = user->bc_values[0]; // Set to prescribed value
+        }
+    }
+    
+    // Right boundary (Dirichlet)
+    if (xs + xn == user->nx) {
+        for (PetscInt j = ys; j < ys+yn; j++) {
+            b_array[j][user->nx-1] = user->bc_values[1]; // Set to prescribed value
+        }
+    }
+    
+    // For Neumann boundaries, no need to modify b as it's handled in the matrix
+    
+    DMDAVecRestoreArray(user->da, b, &b_array);
+    
+    // Solve the linear system: A*Unew = b
+    KSPSolve(user->ksp, b, Unew);
+    
+    // Ensure boundary conditions are satisfied (important for parallel runs)
+    ApplyBoundaryConditions(Unew, user);
+    
+    VecDestroy(&b);
     PetscFunctionReturn(0);
 }
 
@@ -247,34 +280,50 @@ int main(int argc, char **argv) {
     user.kappa = 1.0;
     user.rho = 1.0;
     user.c = 1.0;
-    user.method = 1;  // Default to implicit
-    user.nx = 100;
-    user.dt = 0.001;
-    user.T_final = 0.1;
+    user.method = 1;
+    user.nx = 20;  // Smaller grid for testing
+    user.ny = 20;
+    user.dt = 0.0001;
+    user.T_final = 0.01; // Shorter time for testing
     
-    // Read command line options
+    // Boundary conditions
+    user.bc_values[0] = 1.0;  // Left
+    user.bc_values[1] = 0.0;  // Right
+    user.bc_values[2] = 0.0;  // Bottom (unused)
+    user.bc_values[3] = 0.0;  // Top (unused)
+    
+    user.bc_types[0] = 0;     // Left: Dirichlet
+    user.bc_types[1] = 0;     // Right: Dirichlet
+    user.bc_types[2] = 1;     // Bottom: Neumann
+    user.bc_types[3] = 1;     // Top: Neumann
+    
     PetscOptionsGetInt(NULL, NULL, "-nx", &user.nx, NULL);
+    PetscOptionsGetInt(NULL, NULL, "-ny", &user.ny, NULL);
     PetscOptionsGetReal(NULL, NULL, "-dt", &user.dt, NULL);
     PetscOptionsGetReal(NULL, NULL, "-T", &user.T_final, NULL);
     PetscOptionsGetInt(NULL, NULL, "-method", &user.method, NULL);
     
     user.dx = 1.0 / (user.nx - 1);
+    user.dy = 1.0 / (user.ny - 1);
     nsteps = (PetscInt)(user.T_final / user.dt) + 1;
     
-    // Create distributed array
-    DMDACreate1d(PETSC_COMM_WORLD, DM_BOUNDARY_GHOSTED, user.nx, 1, 1, NULL, &user.da);
+    DMDACreate2d(PETSC_COMM_WORLD, 
+                DM_BOUNDARY_GHOSTED, DM_BOUNDARY_GHOSTED,
+                DMDA_STENCIL_STAR,
+                user.nx, user.ny,
+                PETSC_DECIDE, PETSC_DECIDE,
+                1, 1,
+                NULL, NULL,
+                &user.da);
     DMSetFromOptions(user.da);
     DMSetUp(user.da);
     
-    // Initialize solver
     Initialize(&user);
-    
-    // Create vectors
     DMCreateGlobalVector(user.da, &U);
     DMCreateGlobalVector(user.da, &Unew);
     SetInitialConditions(U, &user);
+    ApplyBoundaryConditions(U, &user);
     
-    // Time stepping
     PetscTime(&t1);
     for (PetscInt step = 0; step < nsteps; step++) {
         if (user.method == 0) {
@@ -294,13 +343,45 @@ int main(int argc, char **argv) {
     if (rank == 0) {
         PetscPrintf(PETSC_COMM_SELF, "Completed %d steps in %.4f seconds\n", 
                    nsteps, t2-t1);
+        
+        // Print centerline values for comparison
+        PetscScalar **u;
+        DMDAVecGetArray(user.da, U, &u);
+        PetscPrintf(PETSC_COMM_SELF, "\nCenterline values (x=0.5):\n");
+        for (PetscInt j = 0; j < user.ny; j++) {
+            PetscInt i = user.nx/2;
+            PetscPrintf(PETSC_COMM_SELF, "y=%.3f, T=%.6f\n", 
+                       j*user.dy, u[j][i]);
+        }
+        DMDAVecRestoreArray(user.da, U, &u);
     }
     
     // Output solution
-    WriteSolutionToFileSerial(U, &user);    // Serial version (gathers to rank 0)
-    WriteSolutionToFileParallel(U, &user);  // Parallel version (MPI I/O)
+    PetscViewer viewer;
+    PetscViewerASCIIOpen(PETSC_COMM_WORLD, "solution.csv", &viewer);
+    PetscViewerPushFormat(viewer, PETSC_VIEWER_ASCII_CSV);
     
-    // Clean up
+    PetscScalar **u;
+    DMDAVecGetArray(user.da, U, &u);
+    
+    if (rank == 0) {
+        PetscViewerASCIIPrintf(viewer, "x,y,T\n");
+    }
+    
+    PetscInt i, j, xs, ys, xn, yn;
+    DMDAGetCorners(user.da, &xs, &ys, NULL, &xn, &yn, NULL);
+    
+    for (j = ys; j < ys+yn; j++) {
+        PetscReal y = j * user.dy;
+        for (i = xs; i < xs+xn; i++) {
+            PetscReal x = i * user.dx;
+            PetscViewerASCIIPrintf(viewer, "%f,%f,%f\n", x, y, u[j][i]);
+        }
+    }
+    
+    DMDAVecRestoreArray(user.da, U, &u);
+    PetscViewerDestroy(&viewer);
+    
     VecDestroy(&U);
     VecDestroy(&Unew);
     if (user.method == 1) {
