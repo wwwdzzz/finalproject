@@ -15,13 +15,14 @@ typedef struct {
     PetscReal T_final;   // Final time
     PetscInt  method;    // 0=explicit, 1=implicit
     PetscInt  nx, ny;    // Grid dimensions
-    PetscInt  current_step; // Current time step index
     DM        da;        // Distributed array context
     Mat       A;         // Matrix for implicit method
     KSP       ksp;       // Linear solver context
     PetscReal bc_values[4]; // Boundary condition values
     PetscInt  bc_types[4];  // Boundary condition types
     PetscBool verification; // Verification mode flag
+    PetscInt  current_step; // Current time step
+    PetscBool save_snapshots; // Flag to save snapshots for visualization
 } AppCtx;
 
 // Exact solution for verification
@@ -34,6 +35,121 @@ PetscReal ForcingTerm(PetscReal x, PetscReal y, PetscReal t, AppCtx* user) {
     PetscReal term1 = -exp(-t) * sin(M_PI*x) * cos(M_PI*y);  // du/dt term
     PetscReal term2 = user->kappa * (M_PI*M_PI) * exp(-t) * sin(M_PI*x) * cos(M_PI*y);  // diffusion term
     return user->rho * user->c * term1 + term2;
+}
+
+PetscErrorCode SaveSolutionToFile(Vec U, AppCtx* user, PetscReal time) {
+    PetscFunctionBeginUser;
+    PetscMPIInt rank;
+    MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
+    
+    // Only rank 0 will handle file operations
+    if (rank != 0) PetscFunctionReturn(0);
+    
+    char filename[256];
+    sprintf(filename, "solution_%.4f.csv", time);
+    
+    PetscViewer viewer;
+    PetscViewerASCIIOpen(PETSC_COMM_SELF, filename, &viewer);
+    PetscViewerPushFormat(viewer, PETSC_VIEWER_ASCII_CSV);
+    
+    PetscScalar **u;
+    DMDAVecGetArray(user->da, U, &u);
+    
+    PetscInt i, j;
+    PetscViewerASCIIPrintf(viewer, "x,y,T\n");
+    for (j = 0; j < user->ny; j++) {
+        PetscReal y = j * user->dy;
+        for (i = 0; i < user->nx; i++) {
+            PetscReal x = i * user->dx;
+            PetscViewerASCIIPrintf(viewer, "%f,%f,%f\n", x, y, u[j][i]);
+        }
+    }
+    
+    DMDAVecRestoreArray(user->da, U, &u);
+    PetscViewerDestroy(&viewer);
+    
+    PetscFunctionReturn(0);
+}
+
+PetscErrorCode CreateGnuplotScripts(AppCtx* user) {
+    PetscFunctionBeginUser;
+    PetscMPIInt rank;
+    MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
+    
+    // Only rank 0 will handle file operations
+    if (rank != 0) PetscFunctionReturn(0);
+    
+    // Create script for temperature evolution
+    FILE *fp = fopen("plot_temperature.gnuplot", "w");
+    if (!fp) PetscFunctionReturn(1);
+    
+    fprintf(fp, "set terminal pngcairo enhanced size 1000,800\n");
+    fprintf(fp, "set output 'temperature_evolution.png'\n");
+    fprintf(fp, "set title 'Temperature Evolution Over Time'\n");
+    fprintf(fp, "set xlabel 'x'\n");
+    fprintf(fp, "set ylabel 'y'\n");
+    fprintf(fp, "set cblabel 'Temperature'\n");
+    fprintf(fp, "set pm3d map\n");
+    fprintf(fp, "set palette rgbformulae 22,13,-31\n");
+    fprintf(fp, "splot 'solution_0.0000.csv' u 1:2:3 title 't=0', \\\n");
+    fprintf(fp, "      'solution_%.4f.csv' u 1:2:3 title 't=0.25T', \\\n", 0.25*user->T_final);
+    fprintf(fp, "      'solution_%.4f.csv' u 1:2:3 title 't=0.5T', \\\n", 0.5*user->T_final);
+    fprintf(fp, "      'solution_%.4f.csv' u 1:2:3 title 't=0.75T', \\\n", 0.75*user->T_final);
+    fprintf(fp, "      'solution_%.4f.csv' u 1:2:3 title 't=T'\n", user->T_final);
+    fclose(fp);
+    
+    // Create script for temperature derivative
+    fp = fopen("plot_derivative.gnuplot", "w");
+    if (!fp) PetscFunctionReturn(1);
+    
+    fprintf(fp, "set terminal pngcairo enhanced size 1000,800\n");
+    fprintf(fp, "set output 'temperature_derivative.png'\n");
+    fprintf(fp, "set title 'Temperature Gradient (∂u/∂x) Over Time'\n");
+    fprintf(fp, "set xlabel 'x'\n");
+    fprintf(fp, "set ylabel 'Time'\n");
+    fprintf(fp, "set cblabel '∂u/∂x'\n");
+    fprintf(fp, "set pm3d map\n");
+    fprintf(fp, "set palette rgbformulae 22,13,-31\n");
+    fprintf(fp, "splot 'derivative_data.csv' u 1:2:3\n");
+    fclose(fp);
+    
+    PetscFunctionReturn(0);
+}
+
+PetscErrorCode CalculateAndSaveDerivative(Vec U, PetscReal time, AppCtx* user) {
+    PetscFunctionBeginUser;
+    PetscMPIInt rank;
+    MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
+    
+    // Only rank 0 will handle file operations
+    if (rank != 0) PetscFunctionReturn(0);
+    
+    static PetscBool first_call = PETSC_TRUE;
+    FILE *fp;
+    
+    if (first_call) {
+        fp = fopen("derivative_data.csv", "w");
+        fprintf(fp, "x,time,dudx\n");
+        first_call = PETSC_FALSE;
+    } else {
+        fp = fopen("derivative_data.csv", "a");
+    }
+    
+    PetscScalar **u;
+    DMDAVecGetArray(user->da, U, &u);
+    
+    PetscInt i, j = user->ny/2; // Use middle y-coordinate for simplicity
+    
+    for (i = 1; i < user->nx-1; i++) {
+        PetscReal x = i * user->dx;
+        PetscReal dudx = (u[j][i+1] - u[j][i-1]) / (2.0 * user->dx);
+        fprintf(fp, "%f,%f,%f\n", x, time, dudx);
+    }
+    
+    DMDAVecRestoreArray(user->da, U, &u);
+    fclose(fp);
+    
+    PetscFunctionReturn(0);
 }
 
 PetscErrorCode Initialize(AppCtx* user) {
@@ -257,28 +373,28 @@ PetscErrorCode ImplicitEulerStep(Vec U, Vec Unew, AppCtx* user) {
     PetscScalar **b_array;
     DMDAVecGetArray(user->da, b, &b_array);
     
-    PetscInt i, j, xs, ys, xn, yn;
+    PetscInt xs, ys, xn, yn;
     DMDAGetCorners(user->da, &xs, &ys, NULL, &xn, &yn, NULL);
     
     // Left boundary (Dirichlet)
     if (xs == 0) {
-        for (j = ys; j < ys+yn; j++) {
+        for (PetscInt j = ys; j < ys+yn; j++) {
             b_array[j][0] = user->bc_values[0];
         }
     }
     
     // Right boundary (Dirichlet)
     if (xs + xn == user->nx) {
-        for (j = ys; j < ys+yn; j++) {
+        for (PetscInt j = ys; j < ys+yn; j++) {
             b_array[j][user->nx-1] = user->bc_values[1];
         }
     }
     
     // Add forcing term for verification
     if (user->verification) {
-        for (j = ys; j < ys+yn; j++) {
+        for (PetscInt j = ys; j < ys+yn; j++) {
             PetscReal y = j * user->dy;
-            for (i = xs; i < xs+xn; i++) {
+            for (PetscInt i = xs; i < xs+xn; i++) {
                 PetscReal x = i * user->dx;
                 PetscReal t = user->dt * (PetscReal)user->current_step;
                 b_array[j][i] += user->dt * ForcingTerm(x, y, t, user) / (user->rho * user->c);
@@ -342,10 +458,10 @@ PetscErrorCode RunConvergenceTest(AppCtx* user) {
         PetscPrintf(PETSC_COMM_SELF, "dx        Error       Rate\n");
     }
     
-    PetscReal fixed_dt = 1e-7;  // Very small to eliminate temporal error
+    PetscReal fixed_dt = 1e-6;  // Very small to eliminate temporal error
     
     for (PetscInt ref = 0; ref < num_refinements; ref++) {
-        PetscInt nx = 5 * (1 << ref);  // 10, 20, 40, 80, 160
+        PetscInt nx = 10 * (1 << ref);  // 10, 20, 40, 80, 160
         user->nx = nx;
         user->ny = nx;
         user->dx = 1.0 / (user->nx - 1);
@@ -487,6 +603,7 @@ int main(int argc, char **argv) {
     PetscMPIInt    rank;
     PetscLogDouble t1, t2;
     PetscBool      verification = PETSC_FALSE;
+    PetscBool      save_snapshots = PETSC_FALSE;
     
     PetscInitialize(&argc, &argv, NULL, NULL);
     MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
@@ -505,6 +622,7 @@ int main(int argc, char **argv) {
     user.dt = 0.0001;
     user.T_final = 0.01;
     user.verification = PETSC_FALSE;
+    user.save_snapshots = PETSC_FALSE;
     
     // Boundary conditions
     user.bc_values[0] = 1.0;  // Left
@@ -524,11 +642,13 @@ int main(int argc, char **argv) {
     PetscOptionsGetReal(NULL, NULL, "-T", &user.T_final, NULL);
     PetscOptionsGetInt(NULL, NULL, "-method", &user.method, NULL);
     PetscOptionsGetBool(NULL, NULL, "-verify", &verification, NULL);
+    PetscOptionsGetBool(NULL, NULL, "-save_snapshots", &save_snapshots, NULL);
     
     user.dx = 1.0 / (user.nx - 1);
     user.dy = 1.0 / (user.ny - 1);
     nsteps = (PetscInt)(user.T_final / user.dt) + 1;
     user.verification = verification;
+    user.save_snapshots = save_snapshots;
     
     if (verification) {
         RunConvergenceTest(&user);
@@ -551,8 +671,15 @@ int main(int argc, char **argv) {
         SetInitialConditions(U, &user);
         ApplyBoundaryConditions(U, &user);
         
+        // Save initial condition if snapshots are enabled
+        if (user.save_snapshots) {
+            SaveSolutionToFile(U, &user, 0.0);
+        }
+        
         PetscTime(&t1);
         for (user.current_step = 0; user.current_step < nsteps; user.current_step++) {
+            PetscReal current_time = user.current_step * user.dt;
+            
             if (user.method == 0) {
                 ExplicitEulerStep(U, Unew, &user);
             } else {
@@ -560,12 +687,37 @@ int main(int argc, char **argv) {
             }
             VecSwap(U, Unew);
             
+            // Save snapshots at specific times if enabled
+            if (user.save_snapshots) {
+                PetscReal next_time = (user.current_step + 1) * user.dt;
+                
+                // Check if we've passed any of the snapshot times
+                if (current_time <= 0.25*user.T_final && next_time > 0.25*user.T_final) {
+                    SaveSolutionToFile(Unew, &user, 0.25*user.T_final);
+                }
+                if (current_time <= 0.5*user.T_final && next_time > 0.5*user.T_final) {
+                    SaveSolutionToFile(Unew, &user, 0.5*user.T_final);
+                }
+                if (current_time <= 0.75*user.T_final && next_time > 0.75*user.T_final) {
+                    SaveSolutionToFile(Unew, &user, 0.75*user.T_final);
+                }
+                
+                // Save derivative data for every time step
+                CalculateAndSaveDerivative(Unew, next_time, &user);
+            }
+            
             if (user.current_step % 100 == 0 && rank == 0) {
                 PetscPrintf(PETSC_COMM_SELF, "Step %d/%d, Time %.4f/%.4f\n", 
-                           user.current_step, nsteps, user.current_step*user.dt, user.T_final);
+                           user.current_step, nsteps, current_time, user.T_final);
             }
         }
         PetscTime(&t2);
+        
+        // Save final solution if snapshots are enabled
+        if (user.save_snapshots) {
+            SaveSolutionToFile(U, &user, user.T_final);
+            CreateGnuplotScripts(&user);
+        }
         
         if (rank == 0) {
             PetscPrintf(PETSC_COMM_SELF, "Completed %d steps in %.4f seconds\n", 
@@ -582,32 +734,6 @@ int main(int argc, char **argv) {
             }
             DMDAVecRestoreArray(user.da, U, &u);
         }
-        
-        // Output solution
-        PetscViewer viewer;
-        PetscViewerASCIIOpen(PETSC_COMM_WORLD, "solution.csv", &viewer);
-        PetscViewerPushFormat(viewer, PETSC_VIEWER_ASCII_CSV);
-        
-        PetscScalar **u;
-        DMDAVecGetArray(user.da, U, &u);
-        
-        if (rank == 0) {
-            PetscViewerASCIIPrintf(viewer, "x,y,T\n");
-        }
-        
-        PetscInt i, j, xs, ys, xn, yn;
-        DMDAGetCorners(user.da, &xs, &ys, NULL, &xn, &yn, NULL);
-        
-        for (j = ys; j < ys+yn; j++) {
-            PetscReal y = j * user.dy;
-            for (i = xs; i < xs+xn; i++) {
-                PetscReal x = i * user.dx;
-                PetscViewerASCIIPrintf(viewer, "%f,%f,%f\n", x, y, u[j][i]);
-            }
-        }
-        
-        DMDAVecRestoreArray(user.da, U, &u);
-        PetscViewerDestroy(&viewer);
         
         VecDestroy(&U);
         VecDestroy(&Unew);
